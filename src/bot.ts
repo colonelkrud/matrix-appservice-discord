@@ -1,20 +1,20 @@
 import { DiscordBridgeConfig } from "./config";
 import { DiscordClientFactory } from "./clientfactory";
 import { DiscordStore } from "./store";
+import { DbGuildEmoji } from "./db/dbdataemoji";
+import { DbEvent } from "./db/dbdataevent";
 import { MatrixUser, RemoteUser, Bridge, Entry } from "matrix-appservice-bridge";
 import { Util } from "./util";
+import { MessageProcessor, MessageProcessorOpts } from "./messageprocessor";
 import * as Discord from "discord.js";
 import * as log from "npmlog";
 import * as Bluebird from "bluebird";
 import * as mime from "mime";
-import * as marked from "marked";
 import * as path from "path";
-import * as escapeStringRegexp from "escape-string-regexp";
 
 // Due to messages often arriving before we get a response from the send call,
 // messages get delayed from discord.
 const MSG_PROCESS_DELAY = 750;
-const MATRIX_TO_LINK = "https://matrix.to/#/";
 const PRESENCE_UPDATE_DELAY = 55000; // Synapse updates in 55 second intervals.
 class ChannelLookupResult {
   public channel: Discord.TextChannel;
@@ -29,11 +29,16 @@ export class DiscordBot {
   private bridge: Bridge;
   private presenceInterval: any;
   private sentMessages: string[];
+  private msgProcessor: MessageProcessor;
   constructor(config: DiscordBridgeConfig, store: DiscordStore) {
     this.config = config;
     this.store = store;
     this.sentMessages = [];
     this.clientFactory = new DiscordClientFactory(store, config.auth);
+    this.msgProcessor = new MessageProcessor(
+        new MessageProcessorOpts(this.config.bridge.domain),
+        this,
+    );
   }
 
   public setBridge(bridge: Bridge) {
@@ -48,26 +53,36 @@ export class DiscordBot {
     return this.clientFactory.init().then(() => {
       return this.clientFactory.getClient();
     }).then((client: any) => {
-      client.on("typingStart", (c, u) => { this.OnTyping(c, u, true); });
-      client.on("typingStop", (c, u) => { this.OnTyping(c, u, false); });
+      if (!this.config.bridge.disableTypingNotifications) {
+        client.on("typingStart", (c, u) => { this.OnTyping(c, u, true); });
+        client.on("typingStop", (c, u) => { this.OnTyping(c, u, false);  });
+      }
+      if (!this.config.bridge.disablePresence) {
+        client.on("presenceUpdate", (_, newMember) => { this.UpdatePresence(newMember); });
+      }
       client.on("userUpdate", (_, newUser) => { this.UpdateUser(newUser); });
       client.on("channelUpdate", (_, newChannel) => { this.UpdateRooms(newChannel); });
-      client.on("presenceUpdate", (_, newMember) => { this.UpdatePresence(newMember); });
+      client.on("guildMemberAdd", (newMember) => { this.AddGuildMember(newMember); });
+      client.on("guildMemberRemove", (oldMember) => { this.RemoveGuildMember(oldMember); });
       client.on("guildMemberUpdate", (_, newMember) => { this.UpdateGuildMember(newMember); });
+      client.on("messageDelete", (msg) => {this.DeleteDiscordMessage(msg); });
       client.on("message", (msg) => { Bluebird.delay(MSG_PROCESS_DELAY).then(() => {
           this.OnMessage(msg);
         });
       });
       log.info("DiscordBot", "Discord bot client logged in.");
       this.bot = client;
-      /* Currently synapse sadly times out presence after a minute.
-       * This will set the presence for each user who is not offline */
-      this.presenceInterval = setInterval(
-        this.BulkPresenceUpdate.bind(this),
-        PRESENCE_UPDATE_DELAY,
-      );
-      this.BulkPresenceUpdate();
-      return null;
+
+      if (!this.config.bridge.disablePresence) {
+        /* Currently synapse sadly times out presence after a minute.
+         * This will set the presence for each user who is not offline */
+        this.presenceInterval = setInterval(
+            this.BulkPresenceUpdate.bind(this),
+            PRESENCE_UPDATE_DELAY,
+        );
+        this.BulkPresenceUpdate();
+        return null;
+      }
     });
   }
 
@@ -130,6 +145,11 @@ export class DiscordBot {
   }
 
   public MatrixEventToEmbed(event: any, profile: any, channel: Discord.TextChannel): Discord.RichEmbed {
+    const body = this.config.bridge.disableDiscordMentions ? event.content.body :
+                 this.msgProcessor.FindMentionsInPlainBody(
+                     event.content.body,
+                     channel.members.array(),
+                 );
     if (profile) {
       profile.displayname = profile.displayname || event.sender;
       if (profile.avatar_url) {
@@ -142,11 +162,11 @@ export class DiscordBot {
           icon_url: profile.avatar_url,
           url: `https://matrix.to/#/${event.sender}`,
         },
-        description: this.HandleMentions(event.content.body, channel.members.array()),
+        description: body,
       });
     }
     return new Discord.RichEmbed({
-      description: this.HandleMentions(event.content.body, channel.members.array()),
+      description: body,
     });
   }
 
@@ -197,11 +217,45 @@ export class DiscordBot {
     } catch (err) {
       log.error("DiscordBot", "Couldn't send message. ", err);
     }
-    if (Array.isArray(msg)) {
-      msg.forEach((m) => { this.sentMessages.push(m.id); });
-      return;
+    if (!Array.isArray(msg)) {
+        msg = [msg];
     }
-    this.sentMessages.push(msg.id);
+    msg.forEach((m: Discord.Message) => {
+      log.verbose("DiscordBot", "Sent ", m);
+      this.sentMessages.push(m.id);
+      const evt = new DbEvent();
+      evt.MatrixId = event.event_id + ";" + event.room_id;
+      evt.DiscordId = m.id;
+      // Webhooks don't send guild info.
+      evt.GuildId = guildId;
+      evt.ChannelId = channelId;
+      this.store.Insert(evt);
+    });
+    return;
+  }
+
+  public async ProcessMatrixRedact(event: any) {
+    log.info("DiscordBot", `Got redact request for ${event.redacts}`);
+    log.verbose("DiscordBot", `Event:`, event);
+    const storeEvent = await this.store.Get(DbEvent, {matrix_id: event.redacts + ";" + event.room_id});
+    if (!storeEvent.Result) {
+        log.warn("DiscordBot", `Could not redact because the event was in the store.`);
+        return;
+    }
+    while (storeEvent.Next()) {
+        log.info("DiscordBot", `Deleting discord msg ${storeEvent.DiscordId}`);
+        if (!this.bot.guilds.has(storeEvent.GuildId)) {
+            log.warn("DiscordBot", `Could not redact because the guild could not be found.`);
+            return;
+        }
+        if (!this.bot.guilds.get(storeEvent.GuildId).channels.has(storeEvent.ChannelId)) {
+            log.warn("DiscordBot", `Could not redact because the guild could not be found.`);
+            return;
+        }
+        const channel = <Discord.TextChannel> this.bot.guilds.get(storeEvent.GuildId)
+                        .channels.get(storeEvent.ChannelId);
+        await channel.fetchMessage(storeEvent.DiscordId);
+    }
   }
 
   public OnUserQuery (userId: string): any {
@@ -229,6 +283,34 @@ export class DiscordBot {
     });
   }
 
+  public InitJoinUser(member: Discord.GuildMember, roomIds: string[]): Promise<any> {
+    const intent = this.bridge.getIntentFromLocalpart(`_discord_${member.id}`);
+    return this.UpdateUser(member.user).then(() => {
+      return Bluebird.each(roomIds, (roomId) => intent.join(roomId));
+    }).then(() => {
+      return this.UpdateGuildMember(member, roomIds);
+    });
+  }
+
+  public async GetGuildEmoji(guild: Discord.Guild, id: string): Promise<string> {
+      const dbEmoji: DbGuildEmoji = await this.store.Get(DbGuildEmoji, {emoji_id: id});
+      if (!dbEmoji.Result) {
+          // Fetch the emoji
+          if (!guild.emojis.has(id)) {
+              throw new Error("The guild does not contain the emoji");
+          }
+          const emoji: Discord.Emoji = guild.emojis.get(id);
+          const intent = this.bridge.getIntent();
+          const mxcUrl = (await Util.UploadContentFromUrl(emoji.url, intent, emoji.name)).mxcUrl;
+          dbEmoji.EmojiId = emoji.id;
+          dbEmoji.GuildId = guild.id;
+          dbEmoji.Name = emoji.name;
+          dbEmoji.MxcUrl = mxcUrl;
+          await this.store.Insert(dbEmoji);
+      }
+      return dbEmoji.MxcUrl;
+  }
+
   private GetFilenameForMediaEvent(content): string {
     if (content.body) {
       if (path.extname(content.body) !== "") {
@@ -237,13 +319,6 @@ export class DiscordBot {
       return path.basename(content.body) + "." + mime.extension(content.info.mimetype);
     }
     return "matrix-media." + mime.extension(content.info.mimetype);
-  }
-
-  private HandleMentions(body: string, members: Discord.GuildMember[]): string {
-    for (const member of members) {
-      body = body.replace(new RegExp(escapeStringRegexp(member.displayName), "g"), `<@!${member.id}>`);
-    }
-    return body;
   }
 
   private GetRoomIdsFromChannel(channel: Discord.Channel): Promise<string[]> {
@@ -360,6 +435,10 @@ export class DiscordBot {
   }
 
   private BulkPresenceUpdate() {
+    if (this.config.bridge.disablePresence) {
+      return; // skip if there's nothing to do
+    }
+
     log.verbose("DiscordBot", "Bulk presence update");
     const members = [];
     for (const guild of this.bot.guilds.values()) {
@@ -376,6 +455,10 @@ export class DiscordBot {
 }
 
   private UpdatePresence(guildMember: Discord.GuildMember) {
+    if (this.config.bridge.disablePresence) {
+      return; // skip if there's nothing to do
+    }
+
     const intent = this.bridge.getIntentFromLocalpart(`_discord_${guildMember.id}`);
     try {
       const presence: any = {};
@@ -392,14 +475,27 @@ export class DiscordBot {
     }
   }
 
-  private UpdateGuildMember(guildMember: Discord.GuildMember) {
+  private AddGuildMember(guildMember: Discord.GuildMember) {
+    return this.GetRoomIdsFromGuild(guildMember.guild.id).then((roomIds) => {
+      return this.InitJoinUser(guildMember, roomIds);
+    });
+  }
+
+  private RemoveGuildMember(guildMember: Discord.GuildMember) {
+    const intent = this.bridge.getIntentFromLocalpart(`_discord_${guildMember.id}`);
+    return Bluebird.each(this.GetRoomIdsFromGuild(guildMember.guild.id), (roomId) => {
+      return intent.leave(roomId);
+    });
+  }
+
+  private UpdateGuildMember(guildMember: Discord.GuildMember, roomIds?: string[]) {
     const client = this.bridge.getIntentFromLocalpart(`_discord_${guildMember.id}`).getClient();
     const userId = client.credentials.userId;
     let avatar = null;
     log.info(`Updating nick for ${guildMember.user.username}`);
     Bluebird.each(client.getProfileInfo(userId, "avatar_url").then((avatarUrl) => {
       avatar = avatarUrl.avatar_url;
-      return this.GetRoomIdsFromGuild(guildMember.guild.id);
+      return roomIds || this.GetRoomIdsFromGuild(guildMember.guild.id);
     }), (room) => {
       log.verbose(`Updating ${room}`);
       client.sendStateEvent(room, "m.room.member", {
@@ -421,33 +517,6 @@ export class DiscordBot {
     }).catch((err) => {
       log.verbose("DiscordBot", "Failed to send typing indicator.", err);
     });
-  }
-
-  private FormatDiscordMessage(msg: Discord.Message): string {
-    // Replace Users
-    let content = msg.content;
-    const userRegex = /<@!?([0-9]*)>/g;
-    let results = userRegex.exec(content);
-    while (results !== null) {
-      const id = results[1];
-      const member = msg.guild.members.get(id);
-      const memberId = `@_discord_${id}:${this.config.bridge.domain}`;
-      const memberStr = member ? member.user.username : memberId;
-      content = content.replace(results[0], memberStr);
-      results = userRegex.exec(content);
-    }
-    // Replace channels
-    const channelRegex = /<#?([0-9]*)>/g;
-    results = channelRegex.exec(content);
-    while (results !== null) {
-      const id = results[1];
-      const channel = msg.guild.channels.get(id);
-      const roomId = `#_discord_${msg.guild.id}_${id}:${this.config.bridge.domain}`;
-      const channelStr = channel ? "#" + channel.name : "#" + id;
-      content = content.replace(results[0], `[${channelStr}](${MATRIX_TO_LINK}${roomId})`);
-      results = channelRegex.exec(content);
-    }
-    return content;
   }
 
   private OnMessage(msg: Discord.Message) {
@@ -499,20 +568,41 @@ export class DiscordBot {
         });
       });
       if (msg.content !== null && msg.content !== "") {
-        // Replace mentions.
-        const content = this.FormatDiscordMessage(msg);
-        const fBody = marked(content);
-        rooms.forEach((room) => {
-          intent.sendMessage(room, {
-            body: content,
-            msgtype: "m.text",
-            formatted_body: fBody,
-            format: "org.matrix.custom.html",
-          });
+        this.msgProcessor.FormatDiscordMessage(msg).then((result) => {
+            rooms.forEach((room) => {
+              intent.sendMessage(room, {
+                body: result.body,
+                msgtype: "m.text",
+                formatted_body: result.formattedBody,
+                format: "org.matrix.custom.html",
+            }).then((res) => {
+                    const evt = new DbEvent();
+                    evt.MatrixId = res.event_id + ";" + room;
+                    evt.DiscordId = msg.id;
+                    evt.ChannelId = msg.channel.id;
+                    evt.GuildId = msg.guild.id;
+                    this.store.Insert(evt);
+                });
+            });
         });
       }
     }).catch((err) => {
       log.verbose("DiscordBot", "Failed to send message into room.", err);
     });
   }
+
+    private async DeleteDiscordMessage(msg: Discord.Message) {
+        log.info("DiscordBot", `Got delete event for ${msg.id}`);
+        const storeEvent = await this.store.Get(DbEvent, {discord_id: msg.id});
+        if (!storeEvent.Result) {
+          log.warn("DiscordBot", `Could not redact because the event was in the store.`);
+          return;
+        }
+        while (storeEvent.Next()) {
+          log.info("DiscordBot", `Deleting discord msg ${storeEvent.DiscordId}`);
+          const client = this.bridge.getIntent().getClient();
+          const matrixIds = storeEvent.MatrixId.split(";");
+          await client.redactEvent(matrixIds[1], matrixIds[0]);
+        }
+    }
 }

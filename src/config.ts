@@ -10,6 +10,9 @@ export class DiscordBridgeConfig {
 class DiscordBridgeConfigBridge {
   public domain: string;
   public homeserverUrl: string;
+  public disablePresence: boolean;
+  public disableTypingNotifications: boolean;
+  public disableDiscordMentions: boolean;
 }
 
 class DiscordBridgeConfigDatabase {

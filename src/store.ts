@@ -2,9 +2,9 @@ import * as SQLite3 from "sqlite3";
 import * as log from "npmlog";
 import * as Bluebird from "bluebird";
 import * as fs from "fs";
-import { IDbSchema } from "./dbschema/dbschema";
-
-const CURRENT_SCHEMA = 3;
+import { IDbSchema } from "./db/schema/dbschema";
+import { IDbData} from "./db/dbdatainterface";
+const CURRENT_SCHEMA = 6;
 /**
  * Stores data for specific users and data not specific to rooms.
  */
@@ -22,7 +22,7 @@ export class DiscordStore {
 
   public backup_database(): Promise<null> {
     if (this.filepath === ":memory:") {
-      log.warn("DiscordStore", "Can't backup a :memory: database.");
+      log.info("DiscordStore", "Can't backup a :memory: database.");
       return Promise.resolve();
     }
     const BACKUP_NAME = this.filepath + ".backup";
@@ -55,12 +55,11 @@ export class DiscordStore {
   public async init (overrideSchema: number = 0) {
     log.info("DiscordStore", "Starting DB Init");
     await this.open_database();
-    const oldVersion = await this.getSchemaVersion();
-    let version = oldVersion;
+    let version = await this.getSchemaVersion();
     const targetSchema = overrideSchema || CURRENT_SCHEMA;
     while (version < targetSchema) {
       version++;
-      const schemaClass = require(`./dbschema/v${version}.js`).Schema;
+      const schemaClass = require(`./db/schema/v${version}.js`).Schema;
       const schema = (new schemaClass() as IDbSchema);
       log.info("DiscordStore", `Updating database to v${version}, "${schema.description}"`);
       try {
@@ -79,7 +78,7 @@ export class DiscordStore {
         throw Error("Failure to update to latest schema.");
       }
       this.version = version;
-      await this.setSchemaVersion(oldVersion, version);
+      await this.setSchemaVersion(version);
     }
     log.info("DiscordStore", "Updated database to the latest schema");
   }
@@ -90,24 +89,32 @@ export class DiscordStore {
 
   public create_table (statement: string, tablename: string): Promise<null|Error> {
     return this.db.runAsync(statement).then(() => {
-      log.info("DiscordStore", "Created table ", tablename);
+      log.info("DiscordStore", "Created table", tablename);
     }).catch((err) => {
       throw new Error(`Error creating '${tablename}': ${err}`);
     });
   }
 
   public add_user_token(userId: string, discordId: string, token: string): Promise<null> {
-    log.silly("SQL", "set_user_token => %s", userId);
-    return this.db.runAsync(
-      `
-      INSERT INTO user_id_discord_id (user_id,discord_id) VALUES ($userId,$discordId);
-      INSERT INTO discord_id_token (discord_id,token) VALUES ($discordId,$token);
-      `
-    , {
-      $userId: userId,
-      $discordId: discordId,
-      $token: token,
-    }).catch( (err) => {
+    log.silly("SQL", "add_user_token => %s", userId);
+    return Promise.all([
+        this.db.runAsync(
+          `
+          INSERT INTO user_id_discord_id (discord_id,user_id) VALUES ($userId,$discordId);
+          `
+        , {
+            $userId: userId,
+            $discordId: discordId,
+        }),
+        this.db.runAsync(
+          `
+          INSERT INTO discord_id_token (discord_id,token) VALUES ($discordId,$token);
+          `
+        , {
+            $discordId: discordId,
+            $token: token,
+        }),
+    ]).catch( (err) => {
       log.error("DiscordStore", "Error storing user token %s", err);
       throw err;
     });
@@ -220,6 +227,29 @@ export class DiscordStore {
     });
   }
 
+  public Get<T extends IDbData>(dbType: {new(): T; }, params: any): Promise<T> {
+      const dType = new dbType();
+      log.silly("DiscordStore", `get <${dType.constructor.name}>`);
+      return dType.RunQuery(this, params).then(() => {
+          return dType;
+      });
+  }
+
+  public Insert<T extends IDbData>(data: T): Promise<null> {
+      log.silly("DiscordStore", `insert <${data.constructor.name}>`);
+      return data.Insert(this);
+  }
+
+  public Update<T extends IDbData>(data: T): Promise<null>  {
+      log.silly("DiscordStore", `insert <${data.constructor.name}>`);
+      return data.Update(this);
+  }
+
+  public Delete<T extends IDbData>(data: T): Promise<null>  {
+      log.silly("DiscordStore", `insert <${data.constructor.name}>`);
+      return data.Delete(this);
+  }
+
   private getSchemaVersion ( ): Promise<number> {
     log.silly("DiscordStore", "_get_schema_version");
     return this.db.getAsync(`SELECT version FROM schema`).then((row) => {
@@ -229,14 +259,13 @@ export class DiscordStore {
     });
   }
 
-  private setSchemaVersion (oldVer: number, ver: number): Promise<any> {
+  private setSchemaVersion (ver: number): Promise<any> {
     log.silly("DiscordStore", "_set_schema_version => %s", ver);
     return this.db.getAsync(
       `
       UPDATE schema
       SET version = $ver
-      WHERE version = $old_ver
-      `, {$ver: ver, $old_ver: oldVer},
+      `, {$ver: ver},
     );
   }
 

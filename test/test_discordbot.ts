@@ -40,7 +40,10 @@ describe("DiscordBot", () => {
   let discordBot;
   const config = {
     auth: {
-      botToken: "blah",
+        botToken: "blah",
+    },
+    bridge: {
+        domain: "localhost",
     },
   };
   describe("run()", () => {

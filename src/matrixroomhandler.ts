@@ -54,9 +54,8 @@ export class MatrixRoomHandler {
         if (member.id === this.discord.GetBotId()) {
           continue;
         }
-        const intent = this.bridge.getIntentFromLocalpart(`_discord_${member.id}`);
         promiseChain = promiseChain.return(Bluebird.delay(delay).then(() => {
-          return intent.join(roomId);
+          return this.discord.InitJoinUser(member, [roomId]);
         }));
         delay += JOIN_DELAY;
       }
@@ -73,12 +72,13 @@ export class MatrixRoomHandler {
     }
     if (event.type === "m.room.member" && event.content.membership === "invite") {
       this.HandleInvite(event);
-    }
-    if (event.type === "m.room.message" && context.rooms.remote) {
+    } else if (event.type === "m.room.redaction" && context.rooms.remote) {
+      this.discord.ProcessMatrixRedact(event);
+    } else if (event.type === "m.room.message" && context.rooms.remote) {
       log.verbose("MatrixRoomHandler", "Got m.room.message event");
       const srvChanPair = context.rooms.remote.roomId.substr("_discord".length).split("_", ROOM_NAME_PARTS);
       return this.discord.ProcessMatrixMsgEvent(event, srvChanPair[0], srvChanPair[1]).catch((err) => {
-        log.warn("There was an error sending a matrix event", err);
+        log.warn("MatrixRoomHandler", "There was an error sending a matrix event", err);
       });
     } else {
       log.verbose("MatrixRoomHandler", "Got non m.room.message event");
